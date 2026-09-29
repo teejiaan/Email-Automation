@@ -1,0 +1,6 @@
+1. User selects the excel file and certificates that are needed to be sent.
+2. System checks if the name and certs are verified and if it matches
+3. If it checks out, the matching can be done to be inserted with the gmail.
+4. The system will need to prompt the user for the essential email elements such as (title, subject, and the contents)
+5. For example, the system will only need a template like Dear [Name], bla bla bla and a signature, after that we can just sync everything according to the excel file, inserting the pdf according to the email.
+6. Send it after each implementation.
