@@ -42,7 +42,8 @@ def job_fingerprint(job):
 
 
 class SendLog:
-    def __init__(self, path=LOG_PATH):
+    def __init__(self, path=LOG_PATH, sender_id=None):
+        self.sender_id = sender_id
         self.path = Path(path)
         self.path.parent.mkdir(parents=True, exist_ok=True)
 
@@ -64,6 +65,11 @@ class SendLog:
     def connect(self):
         return sqlite3.connect(self.path, timeout=10)
 
+    def campaign_key(self, campaign_id):
+        if self.sender_id is None:
+            return campaign_id
+        return json.dumps(["google-account", self.sender_id, campaign_id], separators=(",", ":"))
+
     def claim(self, campaign_id, job):
         """Return False for a confirmed previous send.
 
@@ -74,11 +80,24 @@ class SendLog:
 
         recipient = job["recipient"].strip().casefold()
         fingerprint = job_fingerprint(job)
+        original_campaign = campaign_id
+        campaign_id = self.campaign_key(campaign_id)
 
         with closing(self.connect()) as connection:
             with connection:
                 # Prevent two workers claiming the same recipient together.
                 connection.execute("BEGIN IMMEDIATE")
+
+                if self.sender_id is not None:
+                    legacy = connection.execute(
+                        "SELECT 1 FROM sends WHERE campaign_id = ? AND recipient = ?",
+                        (original_campaign, recipient),
+                    ).fetchone()
+                    if legacy:
+                        raise ValueError(
+                            f"{recipient}: older send history exists for this campaign. "
+                            "Its sender is unknown; review the old record before resending."
+                        )
 
                 previous = connection.execute(
                     """
@@ -126,6 +145,7 @@ class SendLog:
 
     def record(self, campaign_id, recipient, status,
                message_id=None, error=None):
+        campaign_id = self.campaign_key(campaign_id)
         if status not in ("sent", "unconfirmed"):
             raise ValueError("Invalid send-log status.")
 

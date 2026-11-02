@@ -83,6 +83,7 @@ def send_batches(
     batch_pause=30,
     dry_run=True,
     campaign_id=None,
+    sender_id=None,
 ):
     if not isinstance(batch_size, int) or isinstance(batch_size, bool):
         raise ValueError("Batch size must be a whole number.")
@@ -109,7 +110,9 @@ def send_batches(
     if not dry_run:
         campaign_id = campaign_id.strip()
 
-    send_log = None if dry_run else SendLog()
+    send_log = None
+    if not dry_run:
+        send_log = SendLog() if sender_id is None else SendLog(sender_id=sender_id)
 
     # Copy the job dictionaries so the caller cannot edit this run's data.
     jobs = [dict(job) for job in jobs]

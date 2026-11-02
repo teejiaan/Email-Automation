@@ -11,6 +11,9 @@ from googleapiclient.discovery import build
 
 
 SCOPES = [
+    "openid",
+    "https://www.googleapis.com/auth/userinfo.email",
+    "https://www.googleapis.com/auth/userinfo.profile",
     "https://www.googleapis.com/auth/gmail.send",
 ]
 
@@ -23,18 +26,17 @@ CREDENTIALS_FILE = CONFIG_DIR / "credentials.json"
 TOKEN_FILE = CONFIG_DIR / "token.json"
 
 
-def connect_gmail():
+def load_credentials(interactive=True, choose_account=False):
     CONFIG_DIR.mkdir(parents=True, exist_ok=True)
     credentials = None
 
     # Reuse a previously authorised account.
-    if TOKEN_FILE.exists():
-        credentials = Credentials.from_authorized_user_file(
-            str(TOKEN_FILE),
-            SCOPES,
-        )
-
-        if not credentials.has_scopes(SCOPES):
+    if TOKEN_FILE.exists() and not choose_account:
+        try:
+            credentials = Credentials.from_authorized_user_file(str(TOKEN_FILE))
+        except ValueError:
+            credentials = None
+        if credentials and not credentials.has_scopes(SCOPES):
             credentials = None
 
     # Refresh an expired login where possible.
@@ -50,6 +52,8 @@ def connect_gmail():
 
     # Otherwise, open Google's browser sign-in.
     if not credentials or not credentials.valid:
+        if not interactive:
+            return None
         if not CREDENTIALS_FILE.exists():
             raise FileNotFoundError(
                 "Google OAuth configuration was not found at:\n"
@@ -64,6 +68,7 @@ def connect_gmail():
         credentials = flow.run_local_server(
             port=0,
             timeout_seconds=180,
+            prompt="select_account",
         )
 
     TOKEN_FILE.write_text(
@@ -71,6 +76,11 @@ def connect_gmail():
         encoding="utf-8",
     )
 
+    return credentials
+
+
+def connect_gmail():
+    credentials = load_credentials()
     return build(
         "gmail",
         "v1",

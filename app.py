@@ -1,1238 +1,818 @@
-import customtkinter as ctk
-import tkinter as tk
 import queue
 import threading
+from io import BytesIO
+from pathlib import Path
+from tkinter import Canvas, filedialog, messagebox, simpledialog
 
-from gmail_service import connect_gmail, send_certificate_email
+import customtkinter as ctk
+
+from account_service import connect_account, logout_account
+from history_view import FONT_FAMILY, HistoryWindow
 from batch_sender import prepare_email_jobs, send_batches
-from tkinter import filedialog, messagebox, simpledialog
-from main import choose_excel_file, choose_certificate_folder
+from certificate_matcher import get_certificates, normalize_name
+from email_templates import personalise_template, save_template, load_template
 from excel_reader import read_participants
-from certificate_matcher import get_certificates, find_certificate
-from email_templates import (
-    personalise_template,
-    save_template,
-    load_template,
-)
+from gmail_service import send_certificate_email
 
-# Function to handle the Excel file selection
-def button_callback_excel():
-    selected_path = choose_excel_file()
+BG = '#F3F5F8'
+CARD = '#FFFFFF'
+INK = '#17243A'
+MUTED = '#65738A'
+ACCENT = '#355FE5'
+BORDER = '#E3E8F0'
 
-    if selected_path:
-        excel_path.set(selected_path)
 
-        excel_path_label.configure(
-            text=f"[EXCEL SHEET SELECTED] : {selected_path}"
+
+class AvatarIcon(Canvas):
+    """A profile image above a separate circular hover halo."""
+
+    def __init__(self, parent, background, command=None):
+        super().__init__(parent, width=50, height=50, bg=background,
+                         highlightthickness=0, borderwidth=0,
+                         cursor='hand2' if command else '')
+        self._photo = None
+        self._halo = self.create_oval(
+            1, 1, 49, 49, fill='#DCBAFC', outline='', state='hidden')
+        self._picture = self.create_image(25, 25)
+        self._initial = self.create_text(
+            25, 25, text='G', fill=INK, font=(FONT_FAMILY, 22, 'bold'))
+        self.bind('<Enter>', lambda event: self.itemconfigure(self._halo, state='normal'))
+        self.bind('<Leave>', lambda event: self.itemconfigure(self._halo, state='hidden'))
+        if command:
+            self.bind('<ButtonRelease-1>', lambda event: command())
+
+    def set_profile(self, photo=None, initial='G'):
+        from PIL import Image, ImageTk
+
+        self._photo = (
+            ImageTk.PhotoImage(photo.resize((44, 44), Image.Resampling.LANCZOS), master=self)
+            if photo is not None else None
         )
+        self.itemconfigure(self._picture, image=self._photo or '')
+        self.itemconfigure(self._initial, text='' if self._photo else initial)
+        self.itemconfigure(self._halo, state='hidden')
 
-        clear_matching_results()
 
-# Function to handle the certificate folder selection
-def button_callback_certificate():
-    selected_folder = choose_certificate_folder()
+class MailerApp(ctk.CTk):
+    def __init__(self, restore_session=True):
+        super().__init__()
+        self.title('GMass Clone - A Certificate Batch Email Sender App')
+        self.geometry('1180x880')
+        self.minsize(900, 680)
+        self.configure(fg_color=BG)
+        self.account = None
+        self.busy = False
+        self.operation = None
+        self.excel_path = ''
+        self.certificate_folder = ''
+        self.participants = []
+        self.matched = False
+        self.preview_index = 0
+        self.preview_people = []
+        self.events = queue.Queue()
+        self.stop_event = threading.Event()
+        self.controls = []
+        self.profile_image = None
+        self.history_window = None
+        self.account_menu = None
+        self.log_visible = False
+        self.grid_rowconfigure(0, weight=1)
+        self.grid_columnconfigure(0, weight=1)
+        self.account_page = ctk.CTkFrame(self, fg_color=BG)
+        self.workspace = ctk.CTkFrame(self, fg_color=BG)
+        for page in (self.account_page, self.workspace):
+            page.grid(row=0, column=0, sticky='nsew')
+        self.build_account_page()
+        self.build_workspace()
+        self.account_page.tkraise()
+        self.protocol('WM_DELETE_WINDOW', self.close_app)
+        self.bind('<Escape>', lambda _event: self.hide_account_menu())
+        self.bind('<Button-1>', self.dismiss_menu, add='+')
+        self.after(100, self.poll_events)
+        if restore_session:
+            self.after(150, lambda: self.connect(interactive=False))
 
-    if selected_folder:
-        certificate_folder_path.set(selected_folder)
+    def label(self, parent, text, size=13, bold=False, **kwargs):
+        return ctk.CTkLabel(parent, text=text, text_color=INK,
+                           font=ctk.CTkFont(
+                               family=FONT_FAMILY, size=size, weight='bold' if bold else 'normal'),
+                           **kwargs)
 
-        certificate_path_label.configure(
-            text=f"[CERTIFICATE FOLDER SELECTED] : {selected_folder}"
-        )
+    def button(self, parent, text, command, primary=False, register=True, **kwargs):
+        button = ctk.CTkButton(
+            parent, text=text, command=command, height=38, corner_radius=10,
+            font=ctk.CTkFont(
+                family=FONT_FAMILY,
+                size=14,
+                weight='bold',
+            ),
+            fg_color=ACCENT if primary else '#EDF1FA',
+            hover_color='#294CC0' if primary else '#DFE6F5',
+            text_color='white' if primary else INK, **kwargs)
+        if register:
+            self.controls.append(button)
+        return button
 
-        clear_matching_results()
-
-# Function to display the matching results in the results box
-def display_results(text):
-    results_box.configure(state="normal")
-    results_box.delete("1.0", "end")
-    results_box.insert("end", text)
-    results_box.configure(state="disabled")
-
-# Function to clear the matching results when a new file or folder is selected
-def clear_matching_results():
-    app_state["participants"] = []
-    app_state["matching_complete"] = False
+    def entry(self, parent, placeholder):
+        widget = ctk.CTkEntry(parent, placeholder_text=placeholder, height=38,
+                              font=ctk.CTkFont(
+                                family=FONT_FAMILY,
+                                size=14,
+                            ),
+                             fg_color=CARD, text_color=INK, border_color=BORDER,
+                             corner_radius=9)
+        self.controls.append(widget)
+        return widget
     
+    def scroll_workspace(self, event):
+        if event.delta:
+            direction = -1 if event.delta > 0 else 1
 
-    display_results("")
-    status_label.configure(
-        text="Selections changed. Match certificates again."
-    )
-
-# Function to match certificates with participants
-def match_certificates():
-    # Discard any previous matching result.
-    app_state["participants"] = []
-    app_state["matching_complete"] = False
-
-    excel_file = excel_path.get()
-    certificate_folder = certificate_folder_path.get()
-
-    if not excel_file:
-        display_results("Please select an Excel file.")
-        status_label.configure(text="Excel file required.")
-        return
-
-    if not certificate_folder:
-        display_results("Please select a certificate folder.")
-        status_label.configure(text="Certificate folder required.")
-        return
-
-    try:
-        participants = read_participants(excel_file)
-        certificates = get_certificates(certificate_folder)
-
-        results = []
-        ready_count = 0
-        missing_count = 0
-
-        for participant in participants:
-            certificate = find_certificate(
-                participant["name"],
-                certificates,
+            self.workspace_scroll._parent_canvas.yview_scroll(
+                direction * 15,
+                "units",
             )
 
-            if certificate:
-                participant["certificate"] = certificate["path"]
+        return "break"
 
-                results.append(
-                    f"[READY] {participant['name']} | "
-                    f"{participant['email']} | "
-                    f"{certificate['filename']}"
-                )
-                ready_count += 1
+    def handle_textbox_scroll(self, event, textbox):
+        if self.focus_get() == textbox._textbox:
+            # Let the focused textbox handle scrolling normally.
+            return None
 
-            else:
-                participant["certificate"] = None
+        # Otherwise, scroll the main page.
+        return self.scroll_workspace(event)
 
-                results.append(
-                    f"[MISSING] {participant['name']} | "
-                    f"{participant['email']} | "
-                    "No certificate found"
-                )
-                missing_count += 1
+    def textbox(self, parent, height, editable=True):
+        widget = ctk.CTkTextbox(parent, height=height, wrap='word',
+                                font=ctk.CTkFont(
+                                    family=FONT_FAMILY,
+                                    size=14,
+                                ),
+                                fg_color='#F8FAFD', text_color=INK,
+                                border_color=BORDER, border_width=1, corner_radius=10)
+        if editable:
+            self.controls.append(widget)
+        else:
+            widget.configure(state='disabled')
+        return widget
 
-        summary = (
-            f"Participants found: {len(participants)}\n"
-            f"Certificates found: {len(certificates)}\n"
-            f"Ready: {ready_count}\n"
-            f"Missing: {missing_count}"
+    @staticmethod
+    def put_text(widget, text, readonly=False):
+        widget.configure(state='normal')
+        widget.delete('1.0', 'end')
+        widget.insert('1.0', text)
+        if readonly:
+            widget.configure(state='disabled')
+
+    def build_account_page(self):
+        self.account_page.grid_rowconfigure((0, 2), weight=1)
+        self.account_page.grid_columnconfigure((0, 2), weight=1)
+        shadow = ctk.CTkFrame(self.account_page, fg_color='#E6EBF3', corner_radius=26)
+        shadow.grid(row=1, column=1, padx=30, pady=30)
+        card = ctk.CTkFrame(shadow, fg_color=CARD, corner_radius=24, width=470)
+        card.pack(padx=(0, 3), pady=(0, 5), fill='both')
+        self.label(card, 'CERTIFICATE MAILER', 12, True).pack(pady=(38, 12))
+        self.label(card, 'A personal touch.\nEvery certificate.', 30, True).pack(padx=40)
+        self.label(card, 'Choose the Google account you want to send from.',
+                   wraplength=360).pack(padx=40, pady=(14, 26))
+        self.account_avatar = AvatarIcon(card, CARD)
+        self.account_avatar.pack(pady=(0, 10))
+        self.account_name = self.label(card, 'Connect your account', 17, True)
+        self.account_name.pack()
+        self.account_email = self.label(card, 'Sign in securely in your browser.')
+        self.account_email.pack(padx=30, pady=(4, 20))
+        self.connect_button = self.button(card, 'Connect with Google', self.connect,
+                                          primary=True, register=False, width=330)
+        self.connect_button.pack(padx=40, pady=5)
+        self.continue_button = self.button(card, 'Continue to workspace', self.show_workspace,
+                                           primary=True, register=False, width=330)
+        self.switch_button = self.button(card, 'Use another account',
+                                         lambda: self.connect(choose_account=True),
+                                         register=False, width=330)
+        self.auth_status = self.label(card, '', wraplength=350)
+        self.auth_status.pack(padx=35, pady=(16, 12))
+        self.button(card, 'Quit', self.close_app, register=False, width=90).pack(pady=(0, 24))
+
+    def build_workspace(self):
+        self.workspace.grid_columnconfigure(0, weight=1)
+        self.workspace.grid_rowconfigure(1, weight=1)
+        header = ctk.CTkFrame(self.workspace, fg_color=BG, height=70)
+        header.grid(row=0, column=0, sticky='ew', padx=32, pady=(14, 4))
+        header.grid_columnconfigure(1, weight=1)
+        self.label(header, 'Certificate Mailer', 21, True).grid(row=0, column=0, sticky='w')
+        self.sender_label = self.label(header, '')
+        self.sender_label.grid(row=0, column=1, sticky='e', padx=16)
+        self.avatar_button = AvatarIcon(header, BG, self.toggle_account_menu)
+        self.avatar_button.grid(row=0, column=2)
+
+        scroll = ctk.CTkScrollableFrame(self.workspace, fg_color=BG, corner_radius=0)
+        self.workspace_scroll = scroll
+        scroll.grid(row=1, column=0, sticky='nsew')
+        scroll.grid_columnconfigure((0, 2), weight=1)
+        scroll.grid_columnconfigure(1, weight=8)
+        self.main_card = ctk.CTkFrame(scroll, fg_color=CARD, corner_radius=22,
+                                     border_width=1, border_color=BORDER)
+        self.main_card.grid(row=0, column=1, sticky='ew', padx=16, pady=(14, 26))
+        self.main_card.grid_columnconfigure((0, 1), weight=1, uniform='content')
+        self.label(self.main_card, 'New mailing', 35, True).grid(
+            row=0, column=0, columnspan=2, sticky='w', padx=26, pady=(24, 4))
+        self.label(self.main_card, 'Match your files, compose a message, then review.').grid(
+            row=1, column=0, columnspan=2, sticky='w', padx=26, pady=(0, 20))
+        self.campaign_entry = self.entry(self.main_card, 'Campaign name, e.g. workshop-november-2026')
+        self.campaign_entry.grid(row=2, column=0, columnspan=2, sticky='ew', padx=26)
+
+        files = ctk.CTkFrame(self.main_card, fg_color='#F7F9FC', corner_radius=14)
+        files.grid(row=3, column=0, columnspan=2, sticky='ew', padx=26, pady=20)
+        files.grid_columnconfigure((0, 1), weight=1, uniform='files')
+        self.label(files, '01   Recipients & certificates', 20, True).grid(
+            row=0, column=0, columnspan=2, sticky='w', padx=16, pady=(15, 10))
+        excel_button = self.button(
+            files,
+            'Choose Excel',
+            self.choose_excel,
         )
 
-        details = "\n".join(results) or "No participants found."
-        display_results(details + "\n\n" + summary)
-
-        status_label.configure(
-            text=f"Matching complete | "
-                 f"Ready: {ready_count} | Missing: {missing_count}"
+        excel_button.configure(
+            fg_color='#15803D',       # Green background
+            hover_color='#166534',    # Darker green on hover
+            text_color='white',
         )
 
-        # Retain the data for other callbacks.
-        app_state["participants"] = participants
-        app_state["matching_complete"] = True
-
-    except Exception as error:
-        display_results(f"An error occurred: {error}")
-        status_label.configure(text="Matching failed.")
-
-# Function to get the email template from the GUI
-def get_template_from_gui():
-    return {
-        "subject": subject_entry.get().strip(),
-        "body": body_textbox.get("1.0", "end-1c"),
-        "signature": signature_textbox.get("1.0", "end-1c"),
-    }
-
-# Function to preview the emails for matched participants
-def preview_emails():
-    if not app_state["matching_complete"]:
-        messagebox.showwarning(
-            "Match required",
-            "Please match certificates first.",
-            parent=app,
+        excel_button.grid(
+            row=1,
+            column=0,
+            sticky='ew',
+            padx=(16, 8),
         )
-        return
-
-    matched_participants = [
-        participant
-        for participant in app_state["participants"]
-        if participant.get("certificate")
-    ]
-
-    if not matched_participants:
-        messagebox.showwarning(
-            "No matches",
-            "No participants have matching certificates.",
-            parent=app,
+        
+        certificates_button = self.button(
+            files,
+            'Choose certificates',
+            self.choose_certificates,
         )
-        return
 
-    try:
-        template = get_template_from_gui()
-        previews = []
+        certificates_button.configure(
+            fg_color='#1D4F6B',       # Blue background
+            hover_color='#1A3F5B',    # Darker blue on hover
+            text_color='white',
+        )
 
-        for index, participant in enumerate(matched_participants, start=1):
-            message = personalise_template(template, participant)
+        certificates_button.grid(
+            row=1,
+            column=1,
+            sticky='ew',
+            padx=(8, 16),
+        )
 
-            previews.append(
-                f"EMAIL {index} OF {len(matched_participants)}\n"
-                f"To: {participant['email']}\n"
-                f"Subject: {message['subject']}\n"
-                f"Attachment: {participant['certificate']}\n\n"
-                f"{message['body']}"
+        self.excel_label = self.label(files, 'No spreadsheet selected', wraplength=300)
+        self.excel_label.grid(row=2, column=0, padx=16, pady=8)
+        self.cert_label = self.label(files, 'No folder selected', wraplength=300)
+        self.cert_label.grid(row=2, column=1, padx=16, pady=8)
+        
+        check_frame = ctk.CTkFrame(files, fg_color='transparent')
+        check_frame.grid(
+            row=4,
+            column=0,
+            columnspan=2,
+            pady=(0, 14),
+        )
+        check_button = self.button(
+            check_frame,
+            'Check matches',
+            self.match,
+        )
+
+        check_button.configure(
+            fg_color='#753A50',
+            hover_color='#3D1021',
+            text_color='white',
+        )
+
+        check_button.grid(
+            row=0,
+            column=0,
+            padx=(0, 16),
+        )
+        
+        self.match_status = self.label(
+            check_frame,
+            'Select both inputs to begin.',
+            wraplength=300,
+            anchor='center',
+            justify='center',
+        )
+
+        self.match_status.grid(
+            row=1,
+            column=0,
+            padx=16,
+            pady=(0, 14),
+            sticky='ew',
+        )
+
+        editor = ctk.CTkFrame(self.main_card, fg_color='transparent')
+        editor.grid(row=4, column=0, padx=(26, 12), sticky='nsew')
+        editor.grid_columnconfigure(0, weight=1)
+        self.label(editor, '02   Message', 20, True).grid(row=0, column=0, sticky='w', pady=(0, 12))
+        self.subject_entry = self.entry(editor, 'Email subject')
+        self.subject_entry.grid(row=1, column=0, sticky='ew')
+        self.label(editor, 'Message · use [Name] to personalise').grid(row=2, column=0, sticky='w', pady=(12, 5))
+        self.body_box = self.textbox(editor, 190)
+        self.body_box.grid(row=3, column=0, sticky='ew')
+        self.put_text(self.body_box, 'Dear [Name],\n\nPlease find your certificate attached.')
+        self.label(editor, 'Signature').grid(row=4, column=0, sticky='w', pady=(12, 5))
+        self.signature_box = self.textbox(editor, 75)
+        self.signature_box.grid(row=5, column=0, sticky='ew')
+        self.put_text(self.signature_box, 'Best regards,\nEvents Team')
+        template_actions = ctk.CTkFrame(editor, fg_color='transparent')
+        template_actions.grid(row=6, column=0, sticky='ew', pady=12)
+        template_actions.grid_columnconfigure((0, 1), weight=1)
+        self.button(template_actions, 'Load template', self.load).grid(row=0, column=0, padx=(0, 4), sticky='ew')
+        self.button(template_actions, 'Save template', self.save).grid(row=0, column=1, padx=(4, 0), sticky='ew')
+
+        preview = ctk.CTkFrame(self.main_card, fg_color='transparent')
+        preview.grid(row=4, column=1, padx=(12, 26), sticky='nsew')
+        preview.grid_columnconfigure(0, weight=1)
+        self.label(preview, '03   Preview', 20, True).grid(row=0, column=0, sticky='w', pady=(0, 12))
+        self.preview_box = self.textbox(preview, 348, editable=False)
+        self.preview_box.grid(row=1, column=0, sticky='ew')
+        self.put_text(self.preview_box, 'Your personalised message will appear here.\n\nCheck matches, then select Preview.', True)
+        nav = ctk.CTkFrame(preview, fg_color='transparent')
+        nav.grid(row=2, column=0, sticky='ew', pady=(12, 4))
+        nav.grid_columnconfigure(1, weight=1)
+        self.button(nav, '‹', lambda: self.preview(-1), width=40).grid(row=0, column=0)
+        self.preview_count = self.label(nav, 'No preview')
+        self.preview_count.grid(row=0, column=1)
+        self.button(nav, '›', lambda: self.preview(1), width=40).grid(row=0, column=2)
+        self.button(preview, 'Preview messages', self.preview).grid(row=3, column=0, sticky='ew', pady=(4, 12))
+
+        footer = ctk.CTkFrame(self.workspace, fg_color=CARD, corner_radius=16,
+                              border_width=1, border_color=BORDER)
+        footer.grid(row=2, column=0, sticky='ew', padx=32, pady=(4, 16))
+        footer.grid_columnconfigure(0, weight=1)
+        self.status = self.label(footer, 'Ready when you are.', wraplength=700)
+        self.status.grid(row=0, column=0, padx=20, sticky='w', pady=(10, 4))
+        self.progress = ctk.CTkProgressBar(footer, progress_color=ACCENT, fg_color=BORDER)
+        self.progress.grid(row=1, column=0, sticky='ew', padx=20, pady=(0, 10))
+        self.progress.set(0)
+        actions = ctk.CTkFrame(footer, fg_color='transparent')
+        actions.grid(row=2, column=0, sticky='ew', padx=20, pady=(0, 12))
+        actions.grid_columnconfigure(2, weight=1)
+        self.button(actions, 'Test email', self.test_email, width=100).grid(row=0, column=0, padx=(0, 8))
+        self.button(actions, 'Dry run', lambda: self.start_batch(True), width=100).grid(row=0, column=1)
+        self.stop_button = self.button(actions, 'Stop', self.stop, register=False, width=70)
+        self.stop_button.grid(row=0, column=2, sticky='w', padx=8)
+        self.stop_button.configure(state='disabled')
+        self.button(actions, 'Review & send', lambda: self.start_batch(False), primary=True).grid(row=0, column=3)
+        self.button(self.main_card, 'Activity & file details', self.toggle_log, register=False).grid(
+            row=8, column=0, columnspan=2, sticky='w', padx=26, pady=(0, 18))
+        self.log_box = self.textbox(self.main_card, 170, editable=False)
+        for textbox in (
+            self.body_box,
+            self.signature_box,
+            self.preview_box,
+            self.log_box,
+        ):
+            textbox._textbox.bind(
+                "<MouseWheel>",
+                lambda event, box=textbox: self.handle_textbox_scroll(
+                    event, box
+                ),
             )
 
-        separator = "\n\n" + "=" * 60 + "\n\n"
-        display_results(separator.join(previews))
-
-        status_label.configure(
-            text=f"Previewing {len(previews)} emails. Nothing has been sent."
-        )
-
-    except Exception as error:
-        messagebox.showerror(
-            "Preview failed",
-            str(error),
-            parent=app,
-        )
-
-# Function to save the email template to a file
-def save_template_clicked():
-    file_path = filedialog.asksaveasfilename(
-        parent=app,
-        title="Save Email Template",
-        defaultextension=".json",
-        filetypes=[("JSON templates", "*.json")],
-    )
-
-    if not file_path:
-        return
-
-    try:
-        save_template(file_path, get_template_from_gui())
-        status_label.configure(text="Email template saved.")
-
-    except Exception as error:
-        messagebox.showerror(
-            "Save failed",
-            str(error),
-            parent=app,
-        )
-
-# Function to load an email template from a file and populate the GUI fields
-def load_template_clicked():
-    file_path = filedialog.askopenfilename(
-        parent=app,
-        title="Load Email Template",
-        filetypes=[("JSON templates", "*.json")],
-    )
-
-    if not file_path:
-        return
-
-    try:
-        template = load_template(file_path)
-
-        subject_entry.delete(0, "end")
-        subject_entry.insert(0, template["subject"])
-
-        body_textbox.delete("1.0", "end")
-        body_textbox.insert("1.0", template["body"])
-
-        signature_textbox.delete("1.0", "end")
-        signature_textbox.insert("1.0", template["signature"])
-
-        status_label.configure(
-            text="Template loaded. Click Preview Emails to refresh the preview."
-        )
-
-    except Exception as error:
-        messagebox.showerror(
-            "Load failed",
-            str(error),
-            parent=app,
-        )
-
-# Function to save the email template to a file
-def save_template_callback():
-    file_path = filedialog.asksaveasfilename(
-        parent=app,
-        title="Save email template",
-        defaultextension=".json",
-        filetypes=[("JSON templates", "*.json")],
-    )
-
-    if not file_path:
-        return
-
-    try:
-        save_template(file_path, get_template_from_gui())
-        status_label.configure(text="Template saved.")
-    except Exception as error:
-        messagebox.showerror("Save failed", str(error), parent=app)
-
-# Function to load an email template from a file and populate the GUI fields
-def load_template_callback():
-    file_path = filedialog.askopenfilename(
-        parent=app,
-        title="Load email template",
-        filetypes=[("JSON templates", "*.json")],
-    )
-
-    if not file_path:
-        return
-
-    try:
-        template = load_template(file_path)
-
-        subject_entry.delete(0, "end")
-        subject_entry.insert(0, template["subject"])
-
-        body_textbox.delete("1.0", "end")
-        body_textbox.insert("1.0", template["body"])
-
-        signature_textbox.delete("1.0", "end")
-        signature_textbox.insert("1.0", template["signature"])
-
-        display_results("")
-        status_label.configure(
-            text="Template loaded. Click Preview Emails to review it."
-        )
-
-    except Exception as error:
-        messagebox.showerror("Load failed", str(error), parent=app)
-
-# Function to initiate the Gmail connection process in a separate thread
-def connect_gmail_callback():
-    gmail_connect_button.configure(state="disabled")
-    gmail_status_label.configure(
-        text="Connecting — complete Google sign-in in your browser."
-    )
-
-    worker = threading.Thread(
-        target=connect_gmail_worker,
-        daemon=True,
-    )
-    worker.start()
-
-    app.after(100, check_gmail_connection)
-
-# Function to handle the Gmail connection in a separate thread
-def connect_gmail_worker():
-    try:
-        service = connect_gmail()
-        gmail_connection_results.put(("success", service))
-    except Exception as error:
-        gmail_connection_results.put(("error", str(error)))
-
-# Function to check the Gmail connection results and update the GUI accordingly
-def check_gmail_connection():
-    try:
-        outcome, value = gmail_connection_results.get_nowait()
-    except queue.Empty:
-        app.after(100, check_gmail_connection)
-        return
-
-    if outcome == "success":
-        app_state["gmail_service"] = value
-
-        gmail_status_label.configure(
-            text="Gmail authorised."
-        )
-        gmail_connect_button.configure(
-            text="Gmail Connected",
-            state="disabled",
-        )
-
-    else:
-        app_state["gmail_service"] = None
-
-        gmail_status_label.configure(
-            text="Gmail connection failed."
-        )
-        gmail_connect_button.configure(state="normal")
-
-        messagebox.showerror(
-            "Gmail connection failed",
-            value,
-            parent=app,
-        )
-
-# Function to send a test email to the user with a matched certificate
-def send_test_email_callback():
-    if app_state["batch_running"] or app_state["test_running"]:
-        return
-    service = app_state.get("gmail_service")
-
-    if service is None:
-        messagebox.showwarning(
-            "Gmail required",
-            "Please connect Gmail first.",
-            parent=app,
-        )
-        return
-
-    if not app_state["matching_complete"]:
-        messagebox.showwarning(
-            "Match required",
-            "Please match certificates first.",
-            parent=app,
-        )
-        return
-
-    participant = next(
-        (
-            person
-            for person in app_state["participants"]
-            if person.get("certificate")
-        ),
-        None,
-    )
-
-    if participant is None:
-        messagebox.showwarning(
-            "No certificate",
-            "There are no matched certificates to test.",
-            parent=app,
-        )
-        return
-
-    try:
-        message = personalise_template(
-            get_template_from_gui(),
-            participant,
-        )
-    except Exception as error:
-        messagebox.showerror(
-            "Invalid template",
-            str(error),
-            parent=app,
-        )
-        return
-
-    recipient = simpledialog.askstring(
-        "Test recipient",
-        "Enter your own email address for this test:",
-        parent=app,
-    )
-
-    if not recipient:
-        return
-
-    recipient = recipient.strip()
-
-    # Basic single-address check, not mailbox verification.
-    if (
-        recipient.count("@") != 1
-        or recipient.startswith("@")
-        or recipient.endswith("@")
-        or any(char.isspace() for char in recipient)
-        or "," in recipient
-        or ";" in recipient
-    ):
-        messagebox.showerror(
-            "Invalid address",
-            "Enter one email address.",
-            parent=app,
-        )
-        return
-
-    subject = "[TEST] " + message["subject"]
-    certificate_path = participant["certificate"]
-
-    confirmed = messagebox.askyesno(
-        "Send test email",
-        f"Send one real email?\n\n"
-        f"To: {recipient}\n"
-        f"Personalised for: {participant['name']}\n"
-        f"Subject: {subject}\n"
-        f"Attachment: {certificate_path}\n\n"
-        f"{message['body']}",
-        parent=app,
-    )
-
-    if not confirmed:
-        return
-
-    app_state["test_running"] = True
-    start_batch_button.configure(state="disabled")
-    send_batch_button.configure(state="disabled")
-    send_test_button.configure(state="disabled")
-    gmail_status_label.configure(text="Sending test email...")
-
-    threading.Thread(
-        target=send_test_email_worker,
-        args=(
-            service,
-            recipient,
-            subject,
-            message["body"],
-            certificate_path,
-        ),
-        daemon=True,
-    ).start()
-
-    app.after(100, check_test_email_result)
-
-# Function to handle sending the test email in a separate thread
-def send_test_email_worker(
-    service,
-    recipient,
-    subject,
-    body,
-    certificate_path,
-):
-    try:
-        message_id = send_certificate_email(
-            service,
-            recipient,
-            subject,
-            body,
-            certificate_path,
-        )
-        gmail_send_results.put(("success", message_id))
-
-    except Exception as error:
-        gmail_send_results.put(("error", str(error)))
-
-# Function to check the test email sending results and update the GUI accordingly
-def check_test_email_result():
-    try:
-        outcome, value = gmail_send_results.get_nowait()
-    except queue.Empty:
-        app.after(100, check_test_email_result)
-        return
-    
-    app_state["test_running"] = False
-    start_batch_button.configure(state="normal")
-    send_batch_button.configure(state="normal")
-    send_test_button.configure(state="normal")
-
-    if outcome == "success":
-        gmail_status_label.configure(
-            text="Test email accepted by Gmail."
-        )
-        messagebox.showinfo(
-            "Test sent",
-            f"Gmail accepted the email.\n\nMessage ID: {value}",
-            parent=app,
-        )
-
-    else:
-        gmail_status_label.configure(
-            text="Sending was not confirmed."
-        )
-        messagebox.showerror(
-            "Sending was not confirmed",
-            f"{value}\n\n"
-            "If this was a connection error or timeout, "
-            "check Gmail's Sent folder before retrying.",
-            parent=app,
-        )
-
-
-def set_batch_controls(running):
-    app_state["batch_running"] = running
-    state = "disabled" if running else "normal"
-
-    # Freeze selections and template editing during a run.
-    for widget in (
-        excel_button,
-        certificate_button,
-        match_button,
-        subject_entry,
-        body_textbox,
-        signature_textbox,
-        save_button,
-        load_button,
-        preview_button,
-        send_test_button,
-        start_batch_button,
-        campaign_entry,
-        send_batch_button,
-    ):
-        widget.configure(state=state)
-
-    stop_batch_button.configure(
-        state="normal" if running else "disabled"
-    )
-
-
-def append_batch_output(text):
-    results_box.configure(state="normal")
-    results_box.insert("end", text + "\n")
-    results_box.see("end")
-    results_box.configure(state="disabled")
-
-
-def start_batch_callback(dry_run=True):
-    if app_state["batch_running"] or app_state["test_running"]:
-        return
-
-    if not app_state["matching_complete"]:
-        messagebox.showwarning(
-            "Match required",
-            "Please match certificates first.",
-            parent=app,
-        )
-        return
-
-    campaign_id = campaign_entry.get().strip()
-    service = app_state.get("gmail_service")
-
-    if not dry_run:
-        if service is None:
-            messagebox.showwarning(
-                "Gmail required",
-                "Please connect Gmail first.",
-                parent=app,
+            textbox._canvas.bind(
+                "<MouseWheel>",
+                self.scroll_workspace,
             )
+
+    def template(self):
+        return {'subject': self.subject_entry.get().strip(),
+                'body': self.body_box.get('1.0', 'end-1c'),
+                'signature': self.signature_box.get('1.0', 'end-1c')}
+
+    def toggle_log(self):
+        self.log_visible = not self.log_visible
+        if self.log_visible:
+            self.log_box.grid(row=9, column=0, columnspan=2, sticky='ew', padx=26, pady=(0, 20))
+        else:
+            self.log_box.grid_remove()
+
+    def log(self, text):
+        self.log_box.configure(state='normal')
+        self.log_box.insert('end', text + '\n')
+        self.log_box.see('end')
+        self.log_box.configure(state='disabled')
+
+    def error(self, title, error):
+        self.status.configure(text=str(error))
+        self.log(f'{title}: {error}')
+        messagebox.showerror(title, str(error), parent=self)
+
+    def set_busy(self, value, operation=None):
+        self.busy, self.operation = value, operation if value else None
+        for control in self.controls:
+            control.configure(state='disabled' if value else 'normal')
+        for control in (self.connect_button, self.switch_button, self.continue_button):
+            control.configure(state='disabled' if value else 'normal')
+        self.stop_button.configure(state='normal' if value and operation == 'batch' else 'disabled')
+        self.hide_account_menu()
+
+    def connect(self, interactive=True, choose_account=False):
+        if self.busy:
             return
+        self.set_busy(True, 'auth')
+        self.auth_status.configure(text='Complete sign-in in your browser…' if interactive else 'Checking your saved session…')
+        def worker():
+            try:
+                self.events.put(('account', connect_account(interactive, choose_account)))
+            except Exception as error:
+                self.events.put(('auth_error', str(error)))
+        threading.Thread(target=worker, daemon=True).start()
 
-        if not campaign_id:
-            messagebox.showwarning(
-                "Campaign ID required",
-                "Enter a campaign ID for this mailing.",
-                parent=app,
-            )
+    def apply_account(self, account):
+        self.close_history()
+        if self.account and account and self.account.subject != account.subject:
+            self.campaign_entry.delete(0, 'end')
+            self.invalidate_matches()
+        self.account = account
+        self.profile_image = None
+        if account is None:
+            self.account_name.configure(text='Connect your account')
+            self.account_email.configure(text='Sign in securely in your browser.')
+            for widget in (self.account_avatar, self.avatar_button):
+                widget.set_profile()
+            self.continue_button.pack_forget()
+            self.switch_button.pack_forget()
+            self.connect_button.pack(padx=40, pady=5, before=self.auth_status)
             return
+        if account.picture:
+            try:
+                from PIL import Image, ImageDraw, ImageOps
+                photo = ImageOps.fit(Image.open(BytesIO(account.picture)).convert('RGBA'), (80, 80))
+                mask = Image.new('L', (80, 80), 0)
+                ImageDraw.Draw(mask).ellipse((0, 0, 79, 79), fill=255)
+                photo.putalpha(mask)
+                self.profile_image = photo
+            except Exception as error:
+                print(f"Could not load profile image: {error}")
+        initial = account.name.strip()[:1].upper() or 'G'
 
-    try:
-        jobs = prepare_email_jobs(
-            app_state["participants"],
-            get_template_from_gui(),
+        for widget in (self.account_avatar, self.avatar_button):
+            widget.set_profile(self.profile_image, initial)
+        self.account_name.configure(text=account.name)
+        self.account_email.configure(text=account.email)
+        self.sender_label.configure(text=account.email)
+        self.connect_button.pack_forget()
+        self.continue_button.pack(padx=40, pady=5, before=self.auth_status)
+        self.switch_button.pack(padx=40, pady=5, before=self.auth_status)
+
+    def show_workspace(self):
+        if self.account and not self.busy:
+            self.workspace.tkraise()
+
+    def toggle_account_menu(self):
+        if self.account_menu:
+            self.hide_account_menu()
+            return
+        if not self.account:
+            return
+        menu = ctk.CTkFrame(self.workspace, fg_color=CARD, corner_radius=14,
+                           border_color=BORDER, border_width=1)
+        self.account_menu = menu
+        menu.place(relx=1, x=-32, y=64, anchor='ne')
+        menu.lift()
+        self.label(menu, self.account.name, 16, True).pack(padx=22, pady=(18, 3))
+        self.label(menu, self.account.email).pack(padx=22, pady=(0, 14))
+        self.button(menu, 'History', self.show_history, register=False, width=220).pack(padx=14, pady=4)
+        logout = self.button(menu, 'Log out', self.logout, register=False, width=220)
+        logout.pack(padx=14, pady=4)
+        logout.configure(
+            fg_color="#FFE600",       
+            hover_color="#C0B955",    
+            text_color="#080000",    
         )
-    except Exception as error:
-        messagebox.showerror(
-            "Cannot prepare batch",
-            str(error),
-            parent=app,
-        )
-        return
-
-    # Temporary limit for the first live integration test.
-    if not dry_run and len(jobs) > 3:
-        messagebox.showwarning(
-            "Initial live test",
-            "For now, use an Excel file with at most three "
-            "reviewed test recipients.",
-            parent=app,
-        )
-        return
-
-    mode = "Dry run" if dry_run else "Real sending"
-
-    if dry_run:
-        details = (
-            f"Simulate {len(jobs)} emails?\n\n"
-            "No emails will be sent."
-        )
-    else:
-        recipients = "\n".join(
-            f"{job['name']} — {job['recipient']}"
-            for job in jobs
-        )
-        details = (
-            f"Send real emails for campaign '{campaign_id}'?\n\n"
-            f"{recipients}\n\n"
-            "Previously confirmed sends will be skipped.\n"
-            "Confirm that you reviewed the messages and PDF paths."
+        quit = self.button(menu, 'Quit', self.close_app, register=False, width=220)
+        quit.pack(padx=14, pady=4)
+        quit.configure(
+            fg_color="#FF0000",       
+            hover_color="#990000",    
+            text_color="black",    
         )
 
-    confirmed = messagebox.askyesno(
-        mode,
-        details
-        + "\n\nBatch size: 10"
-        + "\nBetween messages: 2 seconds"
-        + "\nBetween batches: 30 seconds",
-        parent=app,
-    )
+  
+        
 
-    if not confirmed:
-        return
+    def close_history(self):
+        if self.history_window is not None:
+            if self.history_window.winfo_exists():
+                self.history_window.destroy()
+            self.history_window = None
 
-    while True:
+    def show_history(self):
+        if self.account is None:
+            return
+        self.hide_account_menu()
+        if self.history_window is not None and self.history_window.winfo_exists():
+            self.history_window.deiconify()
+            self.history_window.lift()
+            self.history_window.refresh()
+            return
+        self.history_window = HistoryWindow(self, self.account)
+        self.history_window.protocol('WM_DELETE_WINDOW', self.close_history)
+
+    def hide_account_menu(self):
+        if self.account_menu:
+            self.account_menu.destroy()
+            self.account_menu = None
+
+    def dismiss_menu(self, event):
+        if not self.account_menu:
+            return
+        widget = event.widget
+        while widget is not None:
+            if widget in (self.account_menu, self.avatar_button):
+                return
+            widget = getattr(widget, 'master', None)
+        self.hide_account_menu()
+
+    def logout(self):
+        if self.busy:
+            return
         try:
-            batch_progress_queue.get_nowait()
-        except queue.Empty:
-            break
-
-    batch_stop_event.clear()
-    app_state["batch_dry_run"] = dry_run
-
-    set_batch_controls(True)
-    batch_progress_bar.set(0)
-
-    display_results(f"{mode.upper()}\n")
-    batch_status_label.configure(text=f"Starting {mode.lower()}...")
-
-    threading.Thread(
-        target=batch_worker,
-        args=(jobs, service, campaign_id, dry_run),
-        daemon=True,
-    ).start()
-
-    app.after(100, check_batch_progress)
-    if app_state["batch_running"] or app_state["test_running"]:
-        return
-
-    if not app_state["matching_complete"]:
-        messagebox.showwarning(
-            "Match required",
-            "Please match certificates first.",
-            parent=app,
-        )
-        return
-
-    try:
-        jobs = prepare_email_jobs(
-            app_state["participants"],
-            get_template_from_gui(),
-        )
-    except Exception as error:
-        messagebox.showerror(
-            "Cannot prepare batch",
-            str(error),
-            parent=app,
-        )
-        return
-
-    confirmed = messagebox.askyesno(
-        "Start dry run",
-        f"Simulate processing {len(jobs)} emails?\n\n"
-        "Batch size: 10\n"
-        "Between messages: 2 seconds\n"
-        "Between batches: 30 seconds\n\n"
-        "No emails will be sent.",
-        parent=app,
-    )
-
-    if not confirmed:
-        return
-
-    # Clear any events left over from a previous run.
-    while True:
-        try:
-            batch_progress_queue.get_nowait()
-        except queue.Empty:
-            break
-
-    batch_stop_event.clear()
-    set_batch_controls(True)
-    batch_progress_bar.set(0)
-
-    display_results("DRY RUN — no emails will be sent.\n")
-    batch_status_label.configure(text="Starting dry run...")
-
-    threading.Thread(
-        target=batch_worker,
-        args=(jobs,),
-        daemon=True,
-    ).start()
-
-    app.after(100, check_batch_progress)
-
-
-def batch_worker(jobs, service, campaign_id, dry_run):
-    try:
-        send_batches(
-            service=service,
-            jobs=jobs,
-            progress_queue=batch_progress_queue,
-            stop_event=batch_stop_event,
-            batch_size=10,
-            message_delay=2,
-            batch_pause=30,
-            dry_run=dry_run,
-            campaign_id=campaign_id,
-        )
-    except Exception as error:
-        batch_progress_queue.put({
-            "type": "worker_error",
-            "error": str(error),
-        })
-
-
-def stop_batch_callback():
-    if app_state["batch_running"]:
-        batch_stop_event.set()
-        stop_batch_button.configure(state="disabled")
-        batch_status_label.configure(text="Stopping...")
-
-
-def check_batch_progress():
-    # Process a bounded number of events to keep the GUI responsive.
-    for _ in range(100):
-        try:
-            event = batch_progress_queue.get_nowait()
-        except queue.Empty:
-            break
-
-        event_type = event["type"]
-
-        if event_type == "started":
-            app_state["batch_total"] = event["total"]
-
-        elif event_type == "sending":
-            action = (
-                "Simulating"
-                if app_state["batch_dry_run"]
-                else "Processing"
-            )
-            batch_status_label.configure(
-                text=f"{action} {event['index']} of {event['total']}"
-            )
-
-        elif event_type in ("simulated", "sent", "skipped"):
-            append_batch_output(
-                f"[{event_type.upper()}] {event['recipient']}"
-            )
-
-            total = app_state.get("batch_total", 0)
-            if total:
-                batch_progress_bar.set(event["index"] / total)
-
-        elif event_type == "waiting":
-            batch_status_label.configure(
-                text=f"Waiting {event['seconds']} seconds..."
-            )
-
-        elif event_type in ("failed", "unconfirmed"):
-            append_batch_output(
-                f"[{event_type.upper()}] "
-                f"{event['recipient']}: {event['error']}"
-            )
-
-        elif event_type == "worker_error":
-            append_batch_output(f"[ERROR] {event['error']}")
-            batch_status_label.configure(text="Processing failed.")
-            set_batch_controls(False)
+            logout_account()
+        except OSError as error:
+            self.error('Could not log out', error)
             return
+        self.hide_account_menu()
+        self.apply_account(None)
+        self.sender_label.configure(text='')
+        self.campaign_entry.delete(0, 'end')
+        self.invalidate_matches()
+        self.excel_path = self.certificate_folder = ''
+        self.excel_label.configure(text='No spreadsheet selected')
+        self.cert_label.configure(text='No folder selected')
+        self.put_text(self.log_box, '', True)
+        self.progress.set(0)
+        self.auth_status.configure(text='Logged out of this application.')
+        self.account_page.tkraise()
 
-        elif event_type == "finished":
-            mode = "Dry run" if event["dry_run"] else "Campaign"
+    def invalidate_matches(self):
+        self.participants, self.preview_people = [], []
+        self.matched = False
+        self.preview_index = 0
+        self.match_status.configure(text='Check matches to continue.')
+        self.preview_count.configure(text='No preview')
+        self.put_text(self.preview_box, 'Check matches, then preview your message.', True)
 
-            summary = (
-                f"{mode} {event['reason']}: "
-                f"{event['processed']} of {event['total']} processed."
-            )
-            append_batch_output(summary)
-            batch_status_label.configure(text=summary)
-            set_batch_controls(False)
+    def choose_excel(self):
+        if self.busy:
             return
+        path = filedialog.askopenfilename(parent=self, title='Choose participant spreadsheet',
+                                          filetypes=[('Excel', '*.xlsx *.xlsm')])
+        if path:
+            self.excel_path = path
+            self.excel_label.configure(text=Path(path).name + ' ✅')
+            self.invalidate_matches()
+            self.log(f'Excel: {path}')
 
-    if app_state["batch_running"]:
-        app.after(100, check_batch_progress)
+    def choose_certificates(self):
+        if self.busy:
+            return
+        path = filedialog.askdirectory(parent=self, title='Choose certificates')
+        if path:
+            self.certificate_folder = path
+            self.cert_label.configure(text=Path(path).name + ' ✅')
+            self.invalidate_matches()
+            self.log(f'Certificates: {path}')
 
+    def match(self):
+        if self.busy:
+            return
+        self.invalidate_matches()
+        if not self.excel_path or not self.certificate_folder:
+            self.error('Select your files', 'Choose an Excel file and a certificate folder first.')
+            return
+        try:
+            people = read_participants(self.excel_path)
+            certificates = get_certificates(self.certificate_folder)
+            ready = 0
+            for person in people:
+                key = normalize_name(person['name'])
+                candidates = [cert for cert in certificates if key and cert['normalized_name'] == key]
+                person['certificate'] = candidates[0]['path'] if len(candidates) == 1 else None
+                if person['certificate']:
+                    ready += 1
+                    self.log(f"Matched: {person['name']} → {person['certificate']}")
+                else:
+                    reason = 'multiple matching PDFs' if len(candidates) > 1 else 'no matching PDF'
+                    self.log(f"Needs review: {person['name']} — {reason}")
+            self.participants, self.matched = people, True
+            self.match_status.configure(text=f'{ready} matched · {len(people) - ready} need review')
+            self.status.configure(text='Matches checked. Review your personalised messages.')
+        except Exception as error:
+            self.error('Matching failed', error)
 
-def on_close():
-    if app_state["batch_running"]:
-        stop_batch_callback()
-        messagebox.showinfo(
-            "Stopping",
-            "Stop has been requested. Wait for processing to finish, "
-            "then close the window again.",
-            parent=app,
-        )
-        return
+    def preview(self, offset=0):
+        if self.busy:
+            return
+        self.preview_people = [p for p in self.participants if p.get('certificate')]
+        if not self.matched or not self.preview_people:
+            self.error('No preview available', 'Check matches and resolve missing certificates first.')
+            return
+        self.preview_index = (self.preview_index + offset) % len(self.preview_people)
+        person = self.preview_people[self.preview_index]
+        try:
+            mail = personalise_template(self.template(), person)
+            self.put_text(self.preview_box,
+                          f"To: {person['email']}\nSubject: {mail['subject']}\n\n"
+                          f"{mail['body']}\n\nAttachment: {Path(person['certificate']).name}", True)
+            self.preview_count.configure(text=f'{self.preview_index + 1} of {len(self.preview_people)}')
+            self.status.configure(text='Preview updated. Nothing has been sent.')
+        except Exception as error:
+            self.error('Preview failed', error)
 
-    if app_state["test_running"]:
-        messagebox.showinfo(
-            "Sending in progress",
-            "Wait for the test email result before closing.",
-            parent=app,
-        )
-        return
+    def save(self):
+        path = filedialog.asksaveasfilename(parent=self, defaultextension='.json',
+                                           filetypes=[('Email template', '*.json')])
+        if path:
+            try:
+                save_template(path, self.template())
+                self.status.configure(text='Template saved.')
+            except Exception as error:
+                self.error('Save failed', error)
 
-    app.destroy()
+    def load(self):
+        path = filedialog.askopenfilename(parent=self, filetypes=[('Email template', '*.json')])
+        if path:
+            try:
+                template = load_template(path)
+                self.subject_entry.delete(0, 'end')
+                self.subject_entry.insert(0, template['subject'])
+                self.put_text(self.body_box, template['body'])
+                self.put_text(self.signature_box, template['signature'])
+                self.put_text(self.preview_box, 'Template loaded. Refresh the preview to review changes.', True)
+                self.status.configure(text='Template loaded.')
+            except Exception as error:
+                self.error('Load failed', error)
 
+    def jobs(self):
+        if not self.matched:
+            raise ValueError('Check matches before continuing.')
+        return prepare_email_jobs(self.participants, self.template())
 
+    def test_email(self):
+        if self.busy or not self.account:
+            return
+        try:
+            job = self.jobs()[0]
+        except Exception as error:
+            self.error('Cannot prepare test', error)
+            return
+        if not messagebox.askyesno('Send one test email',
+                f"Send to your connected account: {self.account.email}?\n\n"
+                f"Personalised for: {job['name']}\nAttachment: {job['certificate_path']}", parent=self):
+            return
+        account = self.account
+        self.set_busy(True, 'test')
+        self.status.configure(text='Sending a test to your connected account…')
+        def worker():
+            try:
+                message_id = send_certificate_email(account.gmail_client(), account.email,
+                    '[TEST] ' + job['subject'], job['body'], job['certificate_path'])
+                self.events.put(('test_success', message_id))
+            except Exception as error:
+                self.events.put(('test_error', str(error)))
+        threading.Thread(target=worker, daemon=True).start()
 
+    def start_batch(self, dry_run=True):
+        if self.busy or not self.account:
+            return
+        campaign = self.campaign_entry.get().strip()
+        try:
+            jobs = self.jobs()
+            if not dry_run and not campaign:
+                raise ValueError('Enter a campaign name. Reuse it when resuming this mailing.')
+            if not dry_run and len(jobs) > 3:
+                raise ValueError('The existing initial live-test limit is three recipients.')
+        except Exception as error:
+            self.error('Cannot start', error)
+            return
+        if not dry_run:
+            review = ctk.CTkToplevel(self)
+            review.title('Review real emails')
+            review.geometry('700x570')
+            review.transient(self)
+            review.grab_set()
+            self.label(review, f'Sending from {self.account.email}', 16, True).pack(padx=20, pady=15)
+            body = self.textbox(review, 345, editable=False)
+            body.pack(fill='both', expand=True, padx=20)
+            self.put_text(body, '\n\n' + ('\n\n' + '─' * 45 + '\n\n').join(
+                f"To: {job['recipient']}\nSubject: {job['subject']}\n"
+                f"Attachment: {job['certificate_path']}\n\n{job['body']}" for job in jobs), True)
+            self.label(review, f'Type the campaign name to confirm: {campaign}').pack(pady=10)
+            confirmation = ctk.CTkEntry(review, width=400)
+            confirmation.pack()
+            def confirm():
+                if confirmation.get().strip() != campaign:
+                    messagebox.showwarning('Campaign name does not match', 'Type the exact campaign name.', parent=review)
+                    return
+                review.destroy()
+                self.launch_batch(jobs, campaign, False)
+            self.button(review, f'Send {len(jobs)} real emails', confirm,
+                         primary=True, register=False).pack(pady=12)
+            return
+        self.launch_batch(jobs, campaign, True)
 
-# This is the main Grid for the application
-app = ctk.CTk()
-app.title("Email Automation")
-app.geometry("1200x800")
-app.grid_columnconfigure(0, weight=1, uniform="main")
-app.grid_columnconfigure(1, weight=1, uniform="main")
-app.grid_rowconfigure(6, weight=1)
+    def launch_batch(self, jobs, campaign, dry_run):
+        if self.busy:
+            return
+        account = self.account
+        self.dry_run = dry_run
+        self.stop_event.clear()
+        self.set_busy(True, 'batch')
+        self.progress.set(0)
+        self.status.configure(text='Starting dry run…' if dry_run else 'Starting campaign…')
+        self.log('DRY RUN — no emails will be sent.' if dry_run else f'Campaign: {campaign} · {account.email}')
+        def worker():
+            try:
+                send_batches(None if dry_run else account.gmail_client(), jobs,
+                             self.events, self.stop_event, batch_size=10,
+                             message_delay=2, batch_pause=30, dry_run=dry_run,
+                             campaign_id=campaign, sender_id=account.subject)
+            except Exception as error:
+                self.events.put(('batch_error', str(error)))
+        threading.Thread(target=worker, daemon=True).start()
 
-excel_path = tk.StringVar(master=app, value="")
-certificate_folder_path = tk.StringVar(master=app, value="")
+    def stop(self):
+        if self.operation == 'batch':
+            self.stop_event.set()
+            self.stop_button.configure(state='disabled')
+            self.status.configure(text='Stopping after the current request…')
 
-app_state = {
-    "participants": [],
-    "matching_complete": False,
-    "gmail_service": None,
-    "batch_running": False,
-    "test_running": False,
-}
+    def poll_events(self):
+        for _ in range(100):
+            try:
+                event = self.events.get_nowait()
+            except queue.Empty:
+                break
+            if isinstance(event, tuple):
+                kind, value = event
+                self.set_busy(False)
+                if kind == 'account':
+                    self.apply_account(value)
+                    self.auth_status.configure(text='Account ready. Continue when you are.' if value else 'Connect to begin.')
+                elif kind == 'auth_error':
+                    self.auth_status.configure(text='Could not connect. Try again with Google.')
+                    self.log(f'Connection: {value}')
+                    messagebox.showerror('Connection failed', value, parent=self)
+                elif kind == 'test_success':
+                    self.status.configure(text='Test email accepted by Gmail.')
+                    self.log(f'Test accepted · message ID {value}')
+                else:
+                    self.error('Sending was not confirmed', value + '\nCheck Sent before retrying an uncertain request.')
+                continue
+            kind = event['type']
+            if kind == 'started':
+                self.batch_total = event['total']
+            elif kind == 'sending':
+                self.status.configure(text=f"{'Simulating' if self.dry_run else 'Processing'} {event['index']} of {event['total']}")
+            elif kind in ('simulated', 'sent', 'skipped'):
+                self.log(f"[{kind.upper()}] {event['recipient']}" +
+                         (f" · {event['message_id']}" if event.get('message_id') else ''))
+                self.progress.set(event['index'] / max(1, self.batch_total))
+            elif kind == 'waiting':
+                self.status.configure(text=f"Waiting {event['seconds']} seconds…")
+            elif kind in ('failed', 'unconfirmed'):
+                self.log(f"{event['recipient']}: {event['error']}")
+                if not self.log_visible:
+                    self.toggle_log()
+            elif kind == 'finished':
+                self.set_busy(False)
+                summary = f"{'Dry run' if event['dry_run'] else 'Campaign'} {event['reason'].replace('_', ' ')} · {event['processed']} of {event['total']} processed"
+                self.status.configure(text=summary)
+                self.log(summary)
+        self.after(100, self.poll_events)
 
-gmail_connection_results = queue.Queue()
-gmail_send_results = queue.Queue()
-batch_progress_queue = queue.Queue()
-batch_stop_event = threading.Event()
+    def close_app(self):
+        if self.busy:
+            self.stop()
+            messagebox.showinfo('Operation in progress',
+                'Wait for the current operation to finish, then quit. A running batch has been asked to stop.', parent=self)
+            return
+        self.destroy()
 
-# Create a Header for the application
-title_label = ctk.CTkLabel(
-    app,
-    text="Certificate Email Automation",
-    font=ctk.CTkFont(size=24, weight="bold"),
-)
-title_label.grid(
-    row=0,
-    column=0,
-    padx=20,
-    pady=(30, 5),
-)
-
-description_label = ctk.CTkLabel(
-    app,
-    text="Select your participant list and certificate folder.",
-)
-description_label.grid(
-    row=1,
-    column=0,
-    padx=20,
-    pady=(0, 20),
-)
-
-
-
-# Create a frame to hold the buttons
-selection_frame = ctk.CTkFrame(app)
-selection_frame.grid(
-    row=2,
-    column=0,
-    padx=20,
-    pady=10,
-    sticky="ew",
-)
-
-selection_frame.grid_columnconfigure(0, weight=1)
-selection_frame.grid_columnconfigure(1, weight=1)
-
-excel_button = ctk.CTkButton(
-    selection_frame,
-    text="Select Excel File",
-    command=button_callback_excel,
-)
-excel_button.grid(
-    row=0,
-    column=0,
-    padx=15,
-    pady=20,
-    sticky="ew",
-)
-
-certificate_button = ctk.CTkButton(
-    selection_frame,
-    text="Select Certificate Folder",
-    command=button_callback_certificate,
-)
-certificate_button.grid(
-    row=0,
-    column=1,
-    padx=15,
-    pady=20,
-    sticky="ew",
-)
-
-
-
-
-# Create labels to display the selected paths
-excel_path_label = ctk.CTkLabel(
-    app,
-    text="[EXCEL SHEET SELECTED] : None",
-    anchor="w",
-)
-excel_path_label.grid(
-    row=3,
-    column=0,
-    padx=20,
-    sticky="ew",
-)
-
-certificate_path_label = ctk.CTkLabel(
-    app,
-     text="[CERTIFICATE FOLDER SELECTED] : None",
-    anchor="w",
-)
-certificate_path_label.grid(
-    row=4,
-    column=0,
-    padx=20,
-    sticky="ew",
-)
-
-
-match_button = ctk.CTkButton(
-    app,
-    text="Match Certificates",
-    command=match_certificates,
-)
-match_button.grid(
-    row=5,
-    column=0,
-    padx=20,
-    pady=10,
-)
-
-# Email template section
-
-
-#Results box to display the results of the matching process
-results_box = ctk.CTkTextbox(app, wrap="word")
-results_box.grid(
-    row=6,
-    column=0,
-    padx=20,
-    pady=10,
-    sticky="nsew",
-)
-results_box.configure(state="disabled")
-
-status_label = ctk.CTkLabel(
-    app,
-    text="Select an Excel file and a certificate folder.",
-)
-status_label.grid(
-    row=7,
-    column=0,
-    padx=20,
-    pady=10,
-)
-
-# Email template editor
-template_frame = ctk.CTkFrame(app)
-template_frame.grid(
-    row=6,
-    column=1,
-    padx=(0, 20),
-    pady=10,
-    sticky="nsew",
-)
-template_frame.grid_columnconfigure(0, weight=1)
-template_frame.grid_rowconfigure(3, weight=1)
-
-subject_label = ctk.CTkLabel(
-    template_frame,
-    text="Subject",
-)
-subject_label.grid(
-    row=0, column=0, padx=15, pady=(10, 0), sticky="w"
-)
-
-subject_entry = ctk.CTkEntry(
-    template_frame,
-    placeholder_text="Your workshop certificate",
-)
-subject_entry.grid(
-    row=1, column=0, padx=15, pady=5, sticky="ew"
-)
-
-body_label = ctk.CTkLabel(
-    template_frame,
-    text="Message — use [Name] for the participant's name",
-)
-body_label.grid(
-    row=2, column=0, padx=15, pady=(10, 0), sticky="w"
-)
-
-body_textbox = ctk.CTkTextbox(
-    template_frame,
-    height=150,
-    wrap="word",
-)
-body_textbox.grid(
-    row=3, column=0, padx=15, pady=5, sticky="nsew"
-)
-body_textbox.insert(
-    "1.0",
-    "Dear [Name],\n\nPlease find your certificate attached.",
-)
-
-signature_label = ctk.CTkLabel(
-    template_frame,
-    text="Signature",
-)
-signature_label.grid(
-    row=4, column=0, padx=15, pady=(10, 0), sticky="w"
-)
-
-signature_textbox = ctk.CTkTextbox(
-    template_frame,
-    height=70,
-    wrap="word",
-)
-signature_textbox.grid(
-    row=5, column=0, padx=15, pady=5, sticky="ew"
-)
-signature_textbox.insert("1.0", "Best regards,\nEvents Team")
-
-template_buttons = ctk.CTkFrame(
-    template_frame,
-    fg_color="transparent",
-)
-template_buttons.grid(
-    row=6, column=0, padx=15, pady=10, sticky="ew"
-)
-template_buttons.grid_columnconfigure((0, 1), weight=1)
-
-save_button = ctk.CTkButton(
-    template_buttons,
-    text="Save Template",
-    command=save_template_callback,
-)
-save_button.grid(
-    row=0, column=0, padx=(0, 5), sticky="ew"
-)
-
-load_button = ctk.CTkButton(
-    template_buttons,
-    text="Load Template",
-    command=load_template_callback,
-)
-load_button.grid(
-    row=0, column=1, padx=(5, 0), sticky="ew"
-)
-
-preview_button = ctk.CTkButton(
-    template_frame,
-    text="Preview Emails",
-    command=preview_emails,
-)
-preview_button.grid(
-    row=7, column=0, padx=15, pady=(0, 15), sticky="ew"
-)
-
-gmail_frame = ctk.CTkFrame(app)
-gmail_frame.grid(
-    row=8,
-    column=0,
-    columnspan=2,
-    padx=20,
-    pady=(0, 15),
-    sticky="ew",
-)
-gmail_frame.grid_columnconfigure(1, weight=1)
-
-gmail_connect_button = ctk.CTkButton(
-    gmail_frame,
-    text="Connect Gmail",
-    command=connect_gmail_callback,
-)
-gmail_connect_button.grid(
-    row=0,
-    column=0,
-    padx=15,
-    pady=10,
-)
-
-gmail_status_label = ctk.CTkLabel(
-    gmail_frame,
-    text="Gmail not connected.",
-    anchor="w",
-)
-gmail_status_label.grid(
-    row=0,
-    column=1,
-    padx=15,
-    pady=10,
-    sticky="ew",
-)
-
-send_test_button = ctk.CTkButton(
-    gmail_frame,
-    text="Send Test Email",
-    command=send_test_email_callback,
-)
-send_test_button.grid(
-    row=0,
-    column=2,
-    padx=15,
-    pady=10,
-)
-
-batch_frame = ctk.CTkFrame(app)
-batch_frame.grid(
-    row=9,
-    column=0,
-    columnspan=2,
-    padx=20,
-    pady=(0, 15),
-    sticky="ew",
-)
-batch_frame.grid_columnconfigure(2, weight=1)
-
-start_batch_button = ctk.CTkButton(
-    batch_frame,
-    text="Start Batch — Dry Run",
-    command=start_batch_callback,
-)
-start_batch_button.grid(
-    row=0, column=0, padx=10, pady=10,
-)
-
-stop_batch_button = ctk.CTkButton(
-    batch_frame,
-    text="Stop",
-    command=stop_batch_callback,
-    state="disabled",
-)
-stop_batch_button.grid(
-    row=0, column=1, padx=10, pady=10,
-)
-
-batch_status_label = ctk.CTkLabel(
-    batch_frame,
-    text="Ready for a dry run.",
-    anchor="w",
-)
-batch_status_label.grid(
-    row=0, column=2, padx=10, pady=10, sticky="ew",
-)
-
-batch_progress_bar = ctk.CTkProgressBar(batch_frame)
-batch_progress_bar.grid(
-    row=1,
-    column=0,
-    columnspan=3,
-    padx=10,
-    pady=(0, 10),
-    sticky="ew",
-)
-batch_progress_bar.set(0)
-
-campaign_label = ctk.CTkLabel(
-    batch_frame,
-    text="Campaign ID:",
-)
-campaign_label.grid(
-    row=2, column=0, padx=10, pady=10, sticky="w",
-)
-
-campaign_entry = ctk.CTkEntry(
-    batch_frame,
-    placeholder_text="e.g. workshop-october-2026",
-)
-campaign_entry.grid(
-    row=2, column=1, columnspan=2,
-    padx=10, pady=10, sticky="ew",
-)
-
-send_batch_button = ctk.CTkButton(
-    batch_frame,
-    text="Send Real Emails",
-    command=lambda: start_batch_callback(dry_run=False),
-)
-send_batch_button.grid(
-    row=3, column=0, columnspan=3,
-    padx=10, pady=(0, 10),
-)
-
-app.protocol("WM_DELETE_WINDOW", on_close)
+    def destroy(self):
+        # Cancel Tk timers before tearing down widgets (also important in tests).
+        for timer in self.tk.call('after', 'info'):
+            self.tk.call('after', 'cancel', timer)
+        super().destroy()
 
 
-app.mainloop()
+def main():
+    ctk.set_appearance_mode('light')
+    MailerApp().mainloop()
+
+
+if __name__ == '__main__':
+    main()
