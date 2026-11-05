@@ -1,4 +1,5 @@
 import queue
+import re
 import threading
 from io import BytesIO
 from pathlib import Path
@@ -10,7 +11,7 @@ from account_service import connect_account, logout_account
 from history_view import FONT_FAMILY, HistoryWindow
 from batch_sender import prepare_email_jobs, send_batches
 from certificate_matcher import get_certificates, normalize_name
-from email_templates import personalise_template, save_template, load_template
+from email_templates import personalise_template, save_template, load_template, variable_key
 from excel_reader import read_participants
 from gmail_service import send_certificate_email
 
@@ -65,6 +66,7 @@ class MailerApp(ctk.CTk):
         self.operation = None
         self.excel_path = ''
         self.certificate_folder = ''
+        self.placeholder_values = {}
         self.participants = []
         self.matched = False
         self.preview_index = 0
@@ -317,7 +319,14 @@ class MailerApp(ctk.CTk):
         self.label(editor, '02   Message', 20, True).grid(row=0, column=0, sticky='w', pady=(0, 12))
         self.subject_entry = self.entry(editor, 'Email subject')
         self.subject_entry.grid(row=1, column=0, sticky='ew')
-        self.label(editor, 'Message · use [Name] to personalise').grid(row=2, column=0, sticky='w', pady=(12, 5))
+        message_heading = ctk.CTkFrame(editor, fg_color='transparent')
+        message_heading.grid(row=2, column=0, sticky='ew', pady=(12, 5))
+        message_heading.grid_columnconfigure(0, weight=1)
+        self.button(message_heading, 'Placeholders', self.edit_placeholders, width=145).grid(row=0, column=0, sticky='w', pady=(0, 6))
+        hint = ctk.CTkFrame(message_heading, fg_color='transparent')
+        hint.grid(row=1, column=0, sticky='w')
+        self.label(hint, 'Message · use [Name] and ').pack(side='left')
+        self.label(hint, 'placeholders', bold=True).pack(side='left')
         self.body_box = self.textbox(editor, 190)
         self.body_box.grid(row=3, column=0, sticky='ew')
         self.put_text(self.body_box, 'Dear [Name],\n\nPlease find your certificate attached.')
@@ -335,7 +344,7 @@ class MailerApp(ctk.CTk):
         preview.grid(row=4, column=1, padx=(12, 26), sticky='nsew')
         preview.grid_columnconfigure(0, weight=1)
         self.label(preview, '03   Preview', 20, True).grid(row=0, column=0, sticky='w', pady=(0, 12))
-        self.preview_box = self.textbox(preview, 348, editable=False)
+        self.preview_box = self.textbox(preview, 393, editable=False)
         self.preview_box.grid(row=1, column=0, sticky='ew')
         self.put_text(self.preview_box, 'Your personalised message will appear here.\n\nCheck matches, then select Preview.', True)
         nav = ctk.CTkFrame(preview, fg_color='transparent')
@@ -386,10 +395,73 @@ class MailerApp(ctk.CTk):
                 self.scroll_workspace,
             )
 
+    def edit_placeholders(self):
+        if self.busy:
+            return
+        dialog = ctk.CTkToplevel(self)
+        dialog.title('Placeholders')
+        dialog.geometry('570x590')
+        dialog.transient(self)
+        dialog.grab_set()
+        self.label(dialog, 'Shared message details', 20, True).pack(padx=20, pady=(20, 8))
+        self.label(dialog, 'Enter shared values, then use [Field name] in your message.\nNon-empty Excel values override these for each recipient.\n[Name] and [Email] always come from Excel.',
+                   wraplength=510).pack(padx=20, pady=(0, 12))
+        fields = ctk.CTkScrollableFrame(dialog)
+        fields.pack(fill='both', expand=True, padx=20)
+        fields.grid_columnconfigure(1, weight=1)
+        entries = {}
+        saved = {variable_key(key): value for key, value in self.placeholder_values.items()}
+
+        def add_field(label):
+            key = variable_key(label)
+            if not key or key in ('name', 'email') or key in entries:
+                return
+            row = len(entries)
+            self.label(fields, f'[{label}]', wraplength=180).grid(row=row, column=0, sticky='w', padx=8, pady=8)
+            entry = ctk.CTkEntry(fields, font=ctk.CTkFont(family=FONT_FAMILY),
+                                 placeholder_text='Optional shared value')
+            entry.grid(row=row, column=1, sticky='ew', padx=8, pady=8)
+            entry.insert(0, saved.get(key, ''))
+            entries[key] = entry
+
+        for label in ('Event', 'Event Details', 'Date', 'Time', 'Position', 'Participation Level'):
+            add_field(label)
+        for label in self.placeholder_values:
+            add_field(label)
+        for field in ('subject', 'body', 'signature'):
+            for label in re.findall(r'\[([^\[\]\r\n]+)\]', self.template()[field]):
+                add_field(label.strip())
+
+        def add_custom():
+            label = simpledialog.askstring('Add placeholder', 'Field name, without brackets:', parent=dialog)
+            if label is None:
+                return
+            label = label.strip()
+            if not label or any(char in label for char in '[]\r\n'):
+                messagebox.showerror('Invalid field', 'Enter a name without brackets or line breaks.', parent=dialog)
+                return
+            if variable_key(label) in ('name', 'email'):
+                messagebox.showinfo('Excel field', 'Name and Email come from the participant spreadsheet.', parent=dialog)
+                return
+            add_field(label)
+
+        def apply():
+            self.placeholder_values = {key: entry.get().strip() for key, entry in entries.items()
+                                       if entry.get().strip()}
+            self.put_text(self.preview_box, 'Placeholders updated. Select Preview to review the message.', True)
+            dialog.destroy()
+
+        actions = ctk.CTkFrame(dialog, fg_color='transparent')
+        actions.pack(fill='x', padx=20, pady=16)
+        self.button(actions, 'Add field', add_custom, register=False, width=120).pack(side='left')
+        self.button(actions, 'Apply', apply, primary=True, register=False, width=100).pack(side='right')
+        self.button(actions, 'Cancel', dialog.destroy, register=False, width=100).pack(side='right', padx=8)
+
     def template(self):
         return {'subject': self.subject_entry.get().strip(),
                 'body': self.body_box.get('1.0', 'end-1c'),
-                'signature': self.signature_box.get('1.0', 'end-1c')}
+                'signature': self.signature_box.get('1.0', 'end-1c'),
+                'variables': dict(self.placeholder_values)}
 
     def toggle_log(self):
         self.log_visible = not self.log_visible
@@ -422,7 +494,7 @@ class MailerApp(ctk.CTk):
         if self.busy:
             return
         self.set_busy(True, 'auth')
-        self.auth_status.configure(text='Complete sign-in in your browser…' if interactive else 'Checking your saved session…')
+        self.auth_status.configure(text='Complete sign-in in your browser. You can quit this app to cancel.' if interactive else 'Checking your saved session…')
         def worker():
             try:
                 self.events.put(('account', connect_account(interactive, choose_account)))
@@ -647,6 +719,7 @@ class MailerApp(ctk.CTk):
         if path:
             try:
                 template = load_template(path)
+                self.placeholder_values = dict(template.get('variables', {}))
                 self.subject_entry.delete(0, 'end')
                 self.subject_entry.insert(0, template['subject'])
                 self.put_text(self.body_box, template['body'])
@@ -795,7 +868,8 @@ class MailerApp(ctk.CTk):
         self.after(100, self.poll_events)
 
     def close_app(self):
-        if self.busy:
+        # Browser sign-in runs on a daemon thread; it must not prevent quitting.
+        if self.busy and self.operation != 'auth':
             self.stop()
             messagebox.showinfo('Operation in progress',
                 'Wait for the current operation to finish, then quit. A running batch has been asked to stop.', parent=self)

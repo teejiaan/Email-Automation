@@ -54,7 +54,11 @@ def prepare_email_jobs(participants, template):
         seen_emails.add(email_key)
         seen_certificates.add(path)
 
-        message = personalise_template(template, participant)
+        try:
+            message = personalise_template(template, participant)
+        except ValueError as error:
+            errors.append(str(error))
+            continue
 
         jobs.append({
             "name": name,

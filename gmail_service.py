@@ -26,6 +26,18 @@ CREDENTIALS_FILE = CONFIG_DIR / "credentials.json"
 TOKEN_FILE = CONFIG_DIR / "token.json"
 
 
+def oauth_config_path():
+    """Use a local override or the desktop client shipped with the executable."""
+    bundled = Path(__file__).resolve().parent / 'oauth' / 'credentials.json'
+    if CREDENTIALS_FILE.is_file():
+        return CREDENTIALS_FILE
+    if bundled.is_file():
+        return bundled
+    raise FileNotFoundError(
+        'Google OAuth configuration is missing. Re-extract the complete application ZIP '
+        f'or place a Desktop client configuration at {CREDENTIALS_FILE}.')
+
+
 def load_credentials(interactive=True, choose_account=False):
     CONFIG_DIR.mkdir(parents=True, exist_ok=True)
     credentials = None
@@ -54,14 +66,10 @@ def load_credentials(interactive=True, choose_account=False):
     if not credentials or not credentials.valid:
         if not interactive:
             return None
-        if not CREDENTIALS_FILE.exists():
-            raise FileNotFoundError(
-                "Google OAuth configuration was not found at:\n"
-                f"{CREDENTIALS_FILE}"
-            )
+        configuration = oauth_config_path()
 
         flow = InstalledAppFlow.from_client_secrets_file(
-            str(CREDENTIALS_FILE),
+            str(configuration),
             SCOPES,
         )
 

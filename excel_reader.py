@@ -1,42 +1,43 @@
+from datetime import date, datetime, time
 from openpyxl import load_workbook
 
 
+def cell_text(value):
+    if value is None:
+        return ''
+    if isinstance(value, datetime):
+        return value.strftime('%d/%m/%Y' if value.time() == time() else '%d/%m/%Y %H:%M')
+    if isinstance(value, date):
+        return value.strftime('%d/%m/%Y')
+    if isinstance(value, time):
+        return value.strftime('%H:%M')
+    return str(value).strip()
+
+
 def read_participants(file_path):
-    workbook = load_workbook(file_path)
-    worksheet = workbook.active
+    from email_templates import variable_key
 
-    participants = []
-
-    # Get column headers from the first row
-    headers = {}
-
-    for cell in worksheet[1]:
-        if cell.value:
-            headers[str(cell.value).strip().lower()] = cell.column
-
-    # Make sure required columns exist
-    if "name" not in headers:
-        raise ValueError("Excel file does not contain a 'Name' column.")
-
-    if "email" not in headers:
-        raise ValueError("Excel file does not contain an 'Email' column.")
-
-    name_column = headers["name"]
-    email_column = headers["email"]
-
-    # Read participant data starting from row 2
-    for row in range(2, worksheet.max_row + 1):
-        name = worksheet.cell(row=row, column=name_column).value
-        email = worksheet.cell(row=row, column=email_column).value
-
-        if name is None and email is None:
-            continue
-
-        participant = {
-            "name": str(name).strip() if name else "",
-            "email": str(email).strip() if email else "",
-        }
-
-        participants.append(participant)
-
-    return participants
+    workbook = load_workbook(file_path, data_only=True)
+    try:
+        worksheet = workbook.active
+        headers = {}
+        for cell in worksheet[1]:
+            if cell.value is not None and str(cell.value).strip():
+                key = variable_key(str(cell.value))
+                if key in headers:
+                    raise ValueError(f"Duplicate Excel column: {cell.value}")
+                headers[key] = cell.column
+        for required in ('name', 'email'):
+            if required not in headers:
+                raise ValueError(f"Excel file does not contain a '{required.title()}' column.")
+        participants = []
+        for row in range(2, worksheet.max_row + 1):
+            values = {key: cell_text(worksheet.cell(row, column).value)
+                      for key, column in headers.items()}
+            if not values['name'] and not values['email']:
+                continue
+            participants.append({'name': values['name'], 'email': values['email'],
+                                 'variables': values})
+        return participants
+    finally:
+        workbook.close()
